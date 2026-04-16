@@ -1,68 +1,15 @@
 -- lua/weaver/init.lua
--- Main entry point for weaver.nvim.
---
--- ── Single-file setup ────────────────────────────────────────────────
---
---   require("weaver").setup({
---     { "nvim-lua/plenary.nvim" },
---     { "nvim-treesitter/nvim-treesitter", event = "BufReadPost" },
---   })
---
--- ── Multi-file setup (recommended) ──────────────────────────────────
---
---   ~/.config/nvim/
---   ├── init.lua
---   └── lua/
---       └── plugins/
---           ├── editor.lua      ← returns spec or list of specs
---           ├── ui.lua
---           ├── lsp.lua
---           └── tools/
---               ├── git.lua
---               └── debug.lua
---
---   require("weaver").setup({
---     { import = "plugins" },          -- Lua module path (dot-notation)
---   })
---
---   -- Or mix inline specs with directory imports freely:
---   require("weaver").setup({
---     { "nvim-lua/plenary.nvim" },     -- inline spec
---     { import = "plugins" },          -- entire directory
---     { import = "plugins.editor" },   -- single sub-module / sub-directory
---     { import = "~/dots/nvim/extra" },-- absolute filesystem path
---   })
---
--- ── Per-file spec format ─────────────────────────────────────────────
---
---   -- lua/plugins/editor.lua  (single spec)
---   return {
---     "nvim-treesitter/nvim-treesitter",
---     event  = { "BufReadPost", "BufNewFile" },
---     build  = ":TSUpdate",
---     config = function()
---       require("nvim-treesitter.configs").setup({ highlight = { enable = true } })
---     end,
---   }
---
---   -- lua/plugins/ui.lua  (multiple specs)
---   return {
---     { "catppuccin/nvim", name = "catppuccin", lazy = false, priority = 1000,
---       config = function() vim.cmd.colorscheme("catppuccin") end },
---     { "nvim-lualine/lualine.nvim", event = "VimEnter", opts = {} },
---   }
-
 local spec_parser = require("weaver.spec")
 local loader      = require("weaver.loader")
 local ui          = require("weaver.ui")
 local util        = require("weaver.util")
 
-local M           = {}
+local M = {}
 
-M._registry       = {} ---@type table<string, WeaverSpec>
-M._specs          = {} ---@type WeaverSpec[]
+M._registry = {} ---@type table<string, WeaverSpec>
+M._specs    = {} ---@type WeaverSpec[]
 
-local defaults    = {
+local defaults = {
   auto_install = true,
   notify_level = vim.log.levels.INFO,
   icons = {
@@ -74,7 +21,7 @@ local defaults    = {
   },
 }
 
-M.options         = {}
+M.options = {}
 
 local function bootstrap_pack(specs)
   local pack_list = {}
@@ -82,7 +29,7 @@ local function bootstrap_pack(specs)
     if not spec.dir then
       local entry = { src = spec.src }
       if spec.version then entry.version = spec.version end
-      if spec.name then entry.name = spec.name end
+      if spec.name    then entry.name    = spec.name    end
       table.insert(pack_list, entry)
     end
   end
@@ -112,12 +59,17 @@ local function load_eager(specs)
       if not ok then
         vim.notify(
           ("[weaver] packadd failed for '%s': %s"):format(spec.name, err),
-          vim.log.levels.WARN)
+          vim.log.levels.WARN
+        )
       end
     end
+
     if spec.config then
       util.safe_call(function() spec.config(spec) end, spec.name .. ".config")
     end
+
+    -- CHANGED: register any declared keymaps after config runs
+    loader.register_keymaps(spec)
   end
 end
 
@@ -131,8 +83,6 @@ end
 function M.setup(raw_specs, opts)
   M.options = util.merge(defaults, opts or {})
 
-  -- spec.parse_all() internally calls importer.expand() before parsing,
-  -- so { import = "..." } entries anywhere in raw_specs are resolved first.
   local specs = spec_parser.parse_all(raw_specs)
   M._specs = specs
 

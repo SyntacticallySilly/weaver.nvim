@@ -6,34 +6,37 @@
 --   name         string  – override plugin name
 --   version      string  – git tag/branch/commit or semver range
 --   dependencies table   – list of specs loaded before this plugin
---   lazy         bool    – force defer until explicitly loaded
---   event        str|tbl – load on VimEvent(s)
---   ft           str|tbl – load on FileType(s)
---   cmd          str|tbl – load on Ex command(s)
---   keys         str|tbl – load on keymap(s)  { lhs, rhs?, mode?, desc? }
+--   lazy         bool    – default TRUE. set false to force eager load,
+--                          which suppresses all event/ft/cmd/keys triggers.
+--   event        str|tbl – load on VimEvent(s)         (ignored when lazy=false)
+--   ft           str|tbl – load on FileType(s)         (ignored when lazy=false)
+--   cmd          str|tbl – load on Ex command(s)       (ignored when lazy=false)
+--   keys         str|tbl – keymap specs { lhs, rhs?, mode?, desc?, ... }
+--                          When lazy=true:  acts as lazy-load trigger + real keymap
+--                          When lazy=false: registers real keymaps only, no stub
 --   priority     int     – loading order (higher = earlier), default 50
 --   enabled      bool|fn – whether plugin is active at all
 --   cond         bool|fn – conditional load (false → disabled)
---   build        str|fn  – run after install/update  (= lazy "build" / "run")
+--   build        str|fn  – run after install/update
 --   config       fn      – called after the plugin is loaded
 --   init         fn      – always called at startup, even for lazy plugins
---   opts         table   – passed to config as second arg (calls setup automatically)
+--   opts         table   – passed to config as second arg (auto-calls setup())
 --   dir          string  – local path (skips vim.pack, just adds to rtp)
 --   url          string  – alias for [1]
 --   import       string  – import a directory or Lua module (handled by importer)
 
 local util     = require("weaver.util")
-local importer = require("weaver.importer") -- ← NEW
+local importer = require("weaver.importer")
 
 ---@class WeaverSpec
 ---@field src       string        Full source URL
 ---@field name      string        Resolved plugin name
 ---@field version   string|nil    Version pin / branch
----@field lazy      boolean       Whether lazy-loading is active
----@field event     string[]|nil  Triggering events
----@field ft        string[]|nil  Triggering filetypes
----@field cmd       string[]|nil  Triggering commands
----@field keys      table[]|nil   Triggering keymaps
+---@field lazy      boolean       Whether lazy-loading is active (default: true)
+---@field event     string[]      Triggering events      (empty when lazy=false)
+---@field ft        string[]      Triggering filetypes   (empty when lazy=false)
+---@field cmd       string[]      Triggering commands    (empty when lazy=false)
+---@field keys      table[]       Keymap specs (trigger + real map, or real map only)
 ---@field priority  integer       Load priority
 ---@field enabled   boolean       Is plugin enabled
 ---@field build     string|function|nil  Post-install/update hook
@@ -43,19 +46,17 @@ local importer = require("weaver.importer") -- ← NEW
 ---@field dir       string|nil    Local directory override
 ---@field deps      WeaverSpec[]  Resolved dependency specs
 
-local M        = {}
+local M = {}
 
---- Normalize any value to a string list.
 ---@param v any
 ---@return string[]
 local function to_list(v)
   if v == nil then return {} end
   if type(v) == "string" then return { v } end
-  if type(v) == "table" then return v end
+  if type(v) == "table"  then return v     end
   return {}
 end
 
---- Evaluate a boolean-or-function field.
 ---@param v boolean|function|nil
 ---@return boolean
 local function eval_bool(v)
@@ -64,8 +65,6 @@ local function eval_bool(v)
   return v ~= false
 end
 
---- Parse a single lazy.nvim-style spec table into a WeaverSpec.
---- Recursively resolves dependencies.
 ---@param raw table|string
 ---@return WeaverSpec|nil
 function M.parse(raw)
@@ -76,36 +75,45 @@ function M.parse(raw)
     return nil
   end
 
-  -- Resolve source
   local src_raw = raw[1] or raw.url or raw.src or raw.dir
   if not src_raw then
     vim.notify("[weaver] Spec missing source: " .. vim.inspect(raw), vim.log.levels.WARN)
     return nil
   end
 
-  local is_local = raw.dir ~= nil or (src_raw:sub(1, 1) == "/" or src_raw:sub(1, 2) == "~/")
-  local src      = is_local and src_raw or util.normalize_src(src_raw)
-  local name     = raw.name or util.name_from_src(src_raw)
+  local is_local = raw.dir ~= nil
+    or (src_raw:sub(1, 1) == "/" or src_raw:sub(1, 2) == "~/")
+  local src  = is_local and src_raw or util.normalize_src(src_raw)
+  local name = raw.name or util.name_from_src(src_raw)
 
   if not eval_bool(raw.enabled) then return nil end
-  if not eval_bool(raw.cond) then return nil end
+  if not eval_bool(raw.cond)    then return nil end
 
-  local has_trigger = raw.event ~= nil or raw.ft ~= nil
-      or raw.cmd ~= nil or raw.keys ~= nil
-  local lazy
-  if raw.lazy == false then
-    lazy = false
-  elseif raw.lazy == true or has_trigger then
-    lazy = true
-  else
-    lazy = false
-  end
+  -- ── Lazy resolution ─────────────────────────────────────────────────
+  -- CHANGED: lazy is TRUE by default.
+  --
+  -- lazy = false  → force eager load; ALL trigger fields (event, ft, cmd)
+  --                 are zeroed out so loader.register_triggers() is never
+  --                 called. keys entries are still kept for real keymap
+  --                 registration, they just won't create stub keymaps.
+  --
+  -- lazy = true   → explicit lazy; triggers wired as-is.
+  -- lazy = nil    → same as true (the new default).
+  -- ────────────────────────────────────────────────────────────────────
+  local lazy = (raw.lazy ~= false) -- CHANGED: nil → true, false → false
 
+  -- When eager, zero out every trigger so register_triggers() has nothing
+  -- to wire. The keys table is intentionally preserved (real keymaps).
+  local event = lazy and to_list(raw.event) or {}   -- CHANGED
+  local ft    = lazy and to_list(raw.ft)    or {}   -- CHANGED
+  local cmd   = lazy and to_list(raw.cmd)   or {}   -- CHANGED
+
+  -- config wrapper: auto-call setup(opts) when opts is present
   local config_fn = raw.config
   if raw.opts ~= nil then
     local opts     = raw.opts
     local user_cfg = raw.config
-    config_fn      = function(plugin)
+    config_fn = function(plugin)
       local resolved_opts = type(opts) == "function" and opts(plugin) or opts
       local ok, mod = pcall(require, name)
       if ok and type(mod.setup) == "function" then
@@ -123,10 +131,10 @@ function M.parse(raw)
     name     = name,
     version  = raw.version or raw.tag or raw.branch,
     lazy     = lazy,
-    event    = to_list(raw.event),
-    ft       = to_list(raw.ft),
-    cmd      = to_list(raw.cmd),
-    keys     = to_list(raw.keys),
+    event    = event,                               -- CHANGED (zeroed when !lazy)
+    ft       = ft,                                  -- CHANGED
+    cmd      = cmd,                                 -- CHANGED
+    keys     = to_list(raw.keys),                   -- always kept (real keymaps)
     priority = raw.priority or 50,
     enabled  = true,
     build    = raw.build or raw.run,
@@ -147,17 +155,13 @@ function M.parse(raw)
   return spec
 end
 
---- Parse a list of raw specs, returning a flat ordered list of WeaverSpecs.
---- *** Import directives are expanded here before parsing begins. ***
 ---@param raws table[]
 ---@return WeaverSpec[]
 function M.parse_all(raws)
-  -- ── EXPAND imports first ────────────────────────────────────────────
-  local expanded = importer.expand(raws) -- ← NEW (one line)
-  -- ───────────────────────────────────────────────────────────────────
+  local expanded = importer.expand(raws)
 
-  local seen     = {}
-  local result   = {}
+  local seen   = {}
+  local result = {}
 
   local function insert(spec)
     if not spec or seen[spec.name] then return end
@@ -167,7 +171,7 @@ function M.parse_all(raws)
   end
 
   local parsed = {}
-  for _, raw in ipairs(expanded) do -- ← uses `expanded` not `raws`
+  for _, raw in ipairs(expanded) do
     local spec = M.parse(raw)
     if spec then table.insert(parsed, spec) end
   end
