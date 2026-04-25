@@ -23,6 +23,7 @@ local defaults = {
 
 M.options = {}
 
+-- Build the vim.pack spec list in a single pass, skipping local plugins
 local function bootstrap_pack(specs)
   local pack_list = {}
   for _, spec in ipairs(specs) do
@@ -30,7 +31,7 @@ local function bootstrap_pack(specs)
       local entry = { src = spec.src }
       if spec.version then entry.version = spec.version end
       if spec.name    then entry.name    = spec.name    end
-      table.insert(pack_list, entry)
+      pack_list[#pack_list + 1] = entry
     end
   end
   if #pack_list > 0 then vim.pack.add(pack_list) end
@@ -45,10 +46,10 @@ local function run_init_hooks(specs)
 end
 
 local function load_eager(specs)
-  local eager = vim.tbl_filter(function(s) return not s.lazy end, specs)
-  table.sort(eager, function(a, b) return a.priority > b.priority end)
+  -- specs is already priority-sorted by spec.parse_all
+  for _, spec in ipairs(specs) do
+    if spec.lazy then goto continue end
 
-  for _, spec in ipairs(eager) do
     if spec.dir then
       vim.opt.runtimepath:prepend(spec.dir)
       if vim.uv.fs_stat(spec.dir .. "/after") then
@@ -68,8 +69,8 @@ local function load_eager(specs)
       util.safe_call(function() spec.config(spec) end, spec.name .. ".config")
     end
 
-    -- CHANGED: register any declared keymaps after config runs
     loader.register_keymaps(spec)
+    ::continue::
   end
 end
 
@@ -84,7 +85,7 @@ function M.setup(raw_specs, opts)
   M.options = util.merge(defaults, opts or {})
 
   local specs = spec_parser.parse_all(raw_specs)
-  M._specs = specs
+  M._specs    = specs
 
   for _, spec in ipairs(specs) do
     M._registry[spec.name] = spec
@@ -104,8 +105,8 @@ function M.add(raw_specs)
   local new_specs = spec_parser.parse_all(raw_specs)
   for _, spec in ipairs(new_specs) do
     if not M._registry[spec.name] then
-      M._registry[spec.name] = spec
-      table.insert(M._specs, spec)
+      M._registry[spec.name]        = spec
+      M._specs[#M._specs + 1]       = spec
     end
   end
   bootstrap_pack(new_specs)

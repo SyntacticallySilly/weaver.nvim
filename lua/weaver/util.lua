@@ -3,8 +3,10 @@
 
 local M = {}
 
+-- Cache stdpath once — vim.fn calls are expensive across hot paths
+local _data_path = vim.fn.stdpath("data")
+
 --- Resolve a plugin name from its source URL or shorthand.
---- Supports both "user/repo" and full "https://github.com/user/repo" forms.
 ---@param src string
 ---@return string
 function M.name_from_src(src)
@@ -15,10 +17,7 @@ end
 ---@param src string
 ---@return string
 function M.normalize_src(src)
-  if src:match("^https?://") then
-    return src
-  end
-  -- "user/repo" shorthand → full GitHub URL
+  if src:sub(1, 4) == "http" then return src end           -- fast prefix check
   if src:match("^[%w%-_.]+/[%w%-_.]+$") then
     return "https://github.com/" .. src
   end
@@ -55,19 +54,31 @@ end
 ---@param name string
 ---@return string
 function M.plugin_path(name)
-  return vim.fs.joinpath(vim.fn.stdpath("data"), "site", "pack", "core", "opt", name)
+  -- Use cached data path; avoid repeated stdpath() calls
+  return _data_path .. "/site/pack/core/opt/" .. name
 end
+
+-- Cache of rtp set, invalidated when rtp changes.
+-- We use a lazy-rebuilt set keyed by rtp length as a cheap dirty-check.
+local _rtp_cache_len = -1
+local _rtp_set       = {} ---@type table<string, boolean>
 
 --- Check if a plugin is currently loaded (in rtp and sourced).
 ---@param name string
 ---@return boolean
 function M.is_loaded(name)
-  for _, p in ipairs(vim.api.nvim_list_runtime_paths()) do
-    if p:match("[/\\]" .. vim.pesc(name) .. "$") then
-      return true
+  local rtp = vim.api.nvim_list_runtime_paths()
+  -- Rebuild the set only when rtp actually changes
+  if #rtp ~= _rtp_cache_len then
+    _rtp_set = {}
+    for _, p in ipairs(rtp) do
+      -- Extract the last path component
+      local tail = p:match("[/\\]([^/\\]+)$")
+      if tail then _rtp_set[tail] = true end
     end
+    _rtp_cache_len = #rtp
   end
-  return false
+  return _rtp_set[name] == true
 end
 
 --- Check whether a plugin directory exists on disk.
